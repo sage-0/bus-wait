@@ -24,6 +24,7 @@ final class LocationProbe: NSObject {
     private var resolutionStartedAt: Date?
     private var resolutionAttempts = 0
     private var lastAttemptAt: Date?
+    private var resolutionTimer: Timer?
 
     private var latestLocation: CLLocation?
     private var latestDistances: [String: Double] = [:]
@@ -85,6 +86,11 @@ final class LocationProbe: NSObject {
         }
         manager.stopUpdatingLocation()
 
+        // 停止後にタイマーだけが生き残ると、計測外の `stop_resolved` が記録されてしまう。
+        resolutionTimer?.invalidate()
+        resolutionTimer = nil
+        resolutionStartedAt = nil
+
         ProbeRecorder.shared.record(type: "probe_stopped")
     }
 
@@ -128,52 +134,96 @@ final class LocationProbe: NSObject {
         resolutionStartedAt = Date()
         resolutionAttempts = 0
         lastAttemptAt = nil
+
+        // 打ち切りを測位の到来に依存させない。判定を `didUpdateLocations` の中だけで行うと、
+        // 位置更新が途絶えている間は経過時間の評価そのものが走らず、3.2 の60秒上限を超える
+        // (実測で 228 秒かかった)。判別が要る場面はバス停で静止している時なので実害がある。
+        //
+        // CLLocationManager のデリゲートはこのクラスを生成したスレッド (main) で呼ばれるため、
+        // ここで張るタイマーは main の run loop に載る。
+        resolutionTimer?.invalidate()
+        resolutionTimer = Timer.scheduledTimer(withTimeInterval: GeoConfig.resolutionMaxDuration,
+                                               repeats: false) { [weak self] _ in
+            guard let self else { return }
+            self.finishResolution(with: self.latestLocation)
+        }
     }
 
-    private func tryResolve(with location: CLLocation) {
-        guard let startedAt = resolutionStartedAt else { return }
+    /// のりば2点との距離。設計書 3.2 の判別はこの2値だけで行う。
+    private struct StopDistances {
+        let a: CLLocationDistance
+        let b: CLLocationDistance
+        let idA: String
+        let idB: String
 
-        let elapsed = Date().timeIntervalSince(startedAt)
-
-        if let lastAttemptAt, Date().timeIntervalSince(lastAttemptAt) < GeoConfig.resolutionRetryInterval {
-            // 再測位は10秒間隔 (設計書 3.2)
-            guard elapsed >= GeoConfig.resolutionMaxDuration else { return }
+        /// 差がしきい値以上なら近い方に確定する。未満なら判別しない。
+        var resolved: String? {
+            guard abs(a - b) >= GeoConfig.resolutionThresholdMeters else { return nil }
+            return a < b ? idA : idB
         }
+    }
 
-        guard let pointA = GeoConfig.stopPoint(id: "campus_hachioji_bound"),
-              let pointB = GeoConfig.stopPoint(id: "campus_minamino_bound") else { return }
+    private func stopDistances(for location: CLLocation?) -> StopDistances? {
+        guard let location,
+              let pointA = GeoConfig.stopPoint(id: "campus_hachioji_bound"),
+              let pointB = GeoConfig.stopPoint(id: "campus_minamino_bound") else { return nil }
+        return StopDistances(a: location.distance(from: GeoConfig.location(of: pointA.center)),
+                             b: location.distance(from: GeoConfig.location(of: pointB.center)),
+                             idA: pointA.id, idB: pointB.id)
+    }
 
-        let dA = location.distance(from: GeoConfig.location(of: pointA.center))
-        let dB = location.distance(from: GeoConfig.location(of: pointB.center))
+    /// 測位が届くたびに呼ばれる。**確定できた場合のみ**終了させる。
+    /// 確定できないまま時間切れになった場合は `startResolution` が張ったタイマーが打ち切る。
+    private func tryResolve(with location: CLLocation) {
+        guard resolutionStartedAt != nil else { return }
+
+        // 再測位は10秒間隔 (設計書 3.2)
+        if let lastAttemptAt, Date().timeIntervalSince(lastAttemptAt) < GeoConfig.resolutionRetryInterval {
+            return
+        }
 
         resolutionAttempts += 1
         lastAttemptAt = Date()
 
-        let resolved: String?
-        if abs(dA - dB) >= GeoConfig.resolutionThresholdMeters {
-            resolved = dA < dB ? pointA.id : pointB.id
-        } else if elapsed >= GeoConfig.resolutionMaxDuration {
-            // 打ち切り。pending のセッションは統計から除外されるが生データは残す (不変条件8)
-            resolved = nil
-        } else {
+        guard stopDistances(for: location)?.resolved != nil else {
             return  // まだ猶予がある。次のサンプルで再試行
+        }
+
+        finishResolution(with: location)
+    }
+
+    /// 判別の終了。確定・打ち切りのいずれもここを通り、`stop_resolved` を1件だけ記録する。
+    ///
+    /// 打ち切り時点でも、最後の測位で距離差がしきい値を超えていれば確定させる。判別できなければ
+    /// `pending` とし、そのセッションは統計から除外されるが生データは残る (不変条件8)。
+    private func finishResolution(with location: CLLocation?) {
+        guard let startedAt = resolutionStartedAt else { return }
+        resolutionStartedAt = nil
+        resolutionTimer?.invalidate()
+        resolutionTimer = nil
+
+        let distances = stopDistances(for: location)
+        let resolved = distances?.resolved
+
+        var payload: [String: Any] = [
+            "resolved": resolved ?? "pending",
+            "accuracy": location?.horizontalAccuracy ?? -1,
+            "attempts": resolutionAttempts,
+            "elapsed_ms": Int(Date().timeIntervalSince(startedAt) * 1000),
+        ]
+        // 測位が一度も届かないまま打ち切られた場合、距離は観測されていない。
+        // 0 を入れると「2点が等距離だった」と読めてしまうのでキーごと落とす。
+        if let distances {
+            payload["d_a"] = distances.a
+            payload["d_b"] = distances.b
         }
 
         ProbeRecorder.shared.record(
             type: "stop_resolved",
             regionId: GeoConfig.campusAreaId,
             stopId: resolved ?? "pending",
-            payload: [
-                "resolved": resolved ?? "pending",
-                "d_a": dA,
-                "d_b": dB,
-                "accuracy": location.horizontalAccuracy,
-                "attempts": resolutionAttempts,
-                "elapsed_ms": Int(elapsed * 1000),
-            ]
+            payload: payload
         )
-
-        resolutionStartedAt = nil
     }
 
     // MARK: - 補助

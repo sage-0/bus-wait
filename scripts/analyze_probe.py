@@ -151,9 +151,14 @@ def report_resolution(events):
         resolved = p.get("resolved")
         if resolved == "pending":
             pending += 1
-        diff = abs(float(p.get("d_a", 0)) - float(p.get("d_b", 0)))
+        # 測位が一度も届かないまま打ち切られた場合、d_a / d_b は記録されない。
+        # 0m と表示すると「2点が等距離だった」と読めてしまうので区別する。
+        if "d_a" in p and "d_b" in p:
+            diff = f"|d_a-d_b|={abs(float(p['d_a']) - float(p['d_b'])):6.1f}m"
+        else:
+            diff = "|d_a-d_b|=   測位なし"
         print(f"  {parse_time(e['occurred_at']):%H:%M:%S}  {resolved:<24}"
-              f"|d_a-d_b|={diff:6.1f}m  試行{p.get('attempts')}回  "
+              f"{diff}  試行{p.get('attempts')}回  "
               f"{p.get('elapsed_ms', 0) / 1000:.1f}秒")
     print(f"\n  pending 率: {pending}/{len(rows)} ({100 * pending / len(rows):.0f}%)")
     print("  → 未決事項#3 (35m しきい値) の較正データ")
