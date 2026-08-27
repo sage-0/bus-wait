@@ -34,6 +34,21 @@ ios/Runner/
 
 以降は `flutter run -d <device-id>` でよい。`flutter devices` で ID を確認する。
 
+### 実測に持ち出す端末には release ビルドを入れる
+
+**debug ビルドはホーム画面から起動できない**（iOS 14 以降の制約。アイコンを叩くと
+"debug mode Flutter apps can only be launched from Flutter tooling" と出て止まる）。
+`flutter run` に繋いだまま Mac ごとバスに乗るわけにいかないので、測定用は release を入れる。
+
+```bash
+flutter build ios --release
+ideviceinstaller -u <device-id> install build/ios/iphoneos/Runner.app
+```
+
+`flutter run --release` はインストール後の起動処理で失敗することがあるが、上記のように
+`ideviceinstaller` で入れれば単独で起動できる。アプリの更新では Documents のデータも
+権限の設定も保持される。
+
 ## 測定手順
 
 ### 準備
@@ -69,6 +84,22 @@ ios/Runner/
 
 iPhone の **ファイル App → 自分の iPhone → Bus Wait** から取り出せる（AirDrop 等でも可）。
 
+### Mac から直接引き抜く
+
+USB 接続していれば端末を触らずに取り出せる。`afcclient` は House arrest を拒否される
+（`Permission denied (10)`）ため `pymobiledevice3` を使う。
+
+```bash
+pip3 install --break-system-packages pymobiledevice3
+
+# ファイル名の確認
+printf 'ls\nexit\n' | python3 -m pymobiledevice3 apps afc --documents jp.ac.teu.busWait
+
+# 取り出し
+printf 'pull probe-2026-08-17.jsonl /tmp/probe.jsonl\nexit\n' \
+  | python3 -m pymobiledevice3 apps afc --documents jp.ac.teu.busWait
+```
+
 ## 解析
 
 ```bash
@@ -90,6 +121,11 @@ python3 ../scripts/analyze_probe.py 端末A.jsonl 端末B.jsonl
 
 ## 既知の制約
 
+- **`motion_sample` はリージョンの外でも緯度経度を1秒間隔で記録する。** 真の通過時刻を距離系列から
+  求めるために必要だが（上記「解析」）、これは設計書 9.1 の「大学と最寄り2駅の周辺以外では位置を
+  一切記録しない」という利用者への保証と真逆である。本実装では 4.2 の測位ウィンドウ限定に
+  置き換わる（不変条件16）。**2端末測定で他人の端末に入れる際は、この点を説明してから同意を得ること**
+- 「使用中のみ許可」だと画面ロックで測位が止まる。測定中は必ず「常に許可」にする
 - Android 未実装。iOS の測定が回り始めてから着手する
 - サーバー送信なし。実測段階ではローカル記録のみ
 - 設定はハードコード。本実装では `GET /v1/config` による配信に置き換わる（不変条件11）
